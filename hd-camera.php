@@ -1,413 +1,636 @@
+<?php
+require_once __DIR__ . '/dbcon.php';
+
+date_default_timezone_set('Asia/Dhaka');
+
+$message = '';
+$error = '';
+
+/* Load active products from database */
+$products = [];
+
+$sql = "SELECT id, name, type, model, price
+        FROM hd_camera_products
+        WHERE status = 1
+        ORDER BY type ASC, name ASC";
+
+$result = $conn->query($sql);
+
+if ($result) {
+    while ($row = $result->fetch_assoc()) {
+        $products[] = $row;
+    }
+}
+
+/* Generate invoice number */
+$invoiceNo = 'HD-' . date('Ymd-His');
+$customerName = '';
+$phone = '';
+$address = '';
+$quotationDate = date('Y-m-d');
+
+/* Save quotation */
+if (
+    $_SERVER['REQUEST_METHOD'] === 'POST' &&
+    isset($_POST['save_quotation'])
+) {
+
+    $customerName = trim($_POST['customer_name'] ?? '');
+    $phone = trim($_POST['phone'] ?? '');
+    $address = trim($_POST['address'] ?? '');
+    $quotationDate = $_POST['quotation_date'] ?? date('Y-m-d');
+    $invoiceNo = trim($_POST['invoice_no'] ?? '');
+
+    $productIds = $_POST['product_id'] ?? [];
+    $quantities = $_POST['quantity'] ?? [];
+    $prices = $_POST['price'] ?? [];
+
+    if (
+        $invoiceNo === '' ||
+        !preg_match('/^\d{4}-\d{2}-\d{2}$/', $quotationDate)
+    ) {
+        $error = 'Please provide a valid invoice number and date.';
+    } elseif (
+        !is_array($productIds) ||
+        !is_array($quantities) ||
+        !is_array($prices)
+    ) {
+        $error = 'Invalid quotation items.';
+    } elseif (
+        count($productIds) !== count($quantities) ||
+        count($productIds) !== count($prices)
+    ) {
+        $error = 'Quotation item data does not match.';
+    } elseif (count($productIds) === 0) {
+        $error = 'Please add at least one product.';
+    } else {
+        $items = [];
+        $grandTotal = 0;
+        $valid = true;
+
+        foreach ($productIds as $i => $productId) {
+            $productId = (int) $productId;
+            $quantity = (float) ($quantities[$i] ?? 0);
+            $price = (float) ($prices[$i] ?? 0);
+
+            // Ignore completely empty rows
+            if ($productId <= 0) {
+                continue;
+            }
+
+            if (
+                !is_finite($quantity) ||
+                !is_finite($price) ||
+                $quantity < 0 ||
+                $price < 0 ||
+                $quantity > 1000000 ||
+                $price > 100000000
+            ) {
+                $valid = false;
+                $error = 'Invalid quantity or price.';
+                break;
+            }
+
+            // Confirm the product exists and is active
+            $stmt = $conn->prepare(
+                "SELECT name FROM hd_camera_products
+                 WHERE id = ? AND status = 1"
+            );
+            $stmt->bind_param("i", $productId);
+            $stmt->execute();
+            $productResult = $stmt->get_result();
+            $product = $productResult->fetch_assoc();
+            $stmt->close();
+
+            if (!$product) {
+                $valid = false;
+                $error = 'A selected product was not found.';
+                break;
+            }
+
+            $lineTotal = round($quantity * $price, 2);
+            $grandTotal += $lineTotal;
+
+            $items[] = [
+                'product_id' => $productId,
+                'product_name' => $product['name'],
+                'quantity' => $quantity,
+                'price' => $price,
+                'total_price' => $lineTotal
+            ];
+        }
+
+        if ($valid && count($items) === 0) {
+            $valid = false;
+            $error = 'Please select at least one product.';
+        }
+
+        if ($valid) {
+            try {
+                $conn->begin_transaction();
+
+                $stmt = $conn->prepare(
+                    "INSERT INTO hd_camera_quotations
+                    (invoice_no, customer_name, phone, address,
+                     quotation_date, grand_total)
+                    VALUES (?, ?, ?, ?, ?, ?)"
+                );
+
+                $stmt->bind_param(
+                    "sssssd",
+                    $invoiceNo,
+                    $customerName,
+                    $phone,
+                    $address,
+                    $quotationDate,
+                    $grandTotal
+                );
+
+                $stmt->execute();
+                $quotationId = $conn->insert_id;
+                $stmt->close();
+
+                $stmt = $conn->prepare(
+                    "INSERT INTO hd_camera_quotation_items
+                    (quotation_id, product_id, product_name,
+                     quantity, price, total_price)
+                    VALUES (?, ?, ?, ?, ?, ?)"
+                );
+
+                foreach ($items as $item) {
+                    $productId = $item['product_id'];
+                    $productName = $item['product_name'];
+                    $quantity = $item['quantity'];
+                    $price = $item['price'];
+                    $lineTotal = $item['total_price'];
+
+                    $stmt->bind_param(
+                        "iisddd",
+                        $quotationId,
+                        $productId,
+                        $productName,
+                        $quantity,
+                        $price,
+                        $lineTotal
+                    );
+
+                    $stmt->execute();
+                }
+
+                $stmt->close();
+                $conn->commit();
+
+                header(
+                    'Location: hd-camera.php?saved=1&invoice=' .
+                        urlencode($invoiceNo)
+                );
+                exit;
+            } catch (Throwable $e) {
+                $conn->rollback();
+                $error = 'Quotation save failed. Please check your database tables and try again.';
+            }
+        }
+    }
+}
+
+if (isset($_GET['saved']) && $_GET['saved'] === '1') {
+    $message = 'Quotation saved successfully! Invoice: ' .
+        htmlspecialchars($_GET['invoice'] ?? '');
+}
+
+/* Products are passed safely to JavaScript */
+$productJson = json_encode(
+    $products,
+    JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP
+);
+?>
 <!DOCTYPE html>
-<html lang="bn">
+<html lang="en">
 
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>HD CAMERA</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
-    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css" rel="stylesheet">
-   
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+
+    <title>HD Camera Quotation</title>
+
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
+        rel="stylesheet">
+
     <style>
         body {
-            background: #f5f6f8
+            background: #f3f6fb;
+            color: #25344a;
         }
 
-        .box {
+        .quotation-card {
+            max-width: 1200px;
+            margin: 35px auto;
+            padding: 28px;
             background: #fff;
-            border-radius: 10px;
-            padding: 25px;
-            box-shadow: 0 3px 15px rgba(0, 0, 0, .08)
+            border-radius: 14px;
+            box-shadow: 0 5px 24px rgba(30, 50, 80, .08);
         }
 
-        .table th {
-            background: #212529;
-            color: #fff;
-            text-align: center;
-            vertical-align: middle
+        .page-heading {
+            color: #263d64;
+            font-weight: 700;
+        }
+
+        .form-label {
+            font-weight: 600;
+        }
+
+        .table thead th {
+            background: #263d64;
+            color: white;
+            white-space: nowrap;
         }
 
         .table td {
-            vertical-align: middle
+            vertical-align: middle;
+            min-width: 100px;
         }
 
-        .sl,
-        .check {
-            text-align: center;
-            width: 55px
+        .table .product-cell {
+            min-width: 240px;
         }
 
-        .price,
-        .quantity,
-        .total {
-            text-align: center
+        .table input,
+        .table select {
+            min-width: 90px;
         }
 
-        .product-select {
-            min-width: 220px
+        .table .product-select {
+            min-width: 230px;
         }
 
-        .plus-btn {
-            margin-left: 5px
+        .total-box {
+            background: #edf3ff;
+            color: #263d64;
+            border-radius: 10px;
+            padding: 18px;
+            font-size: 22px;
+            font-weight: 700;
         }
 
-        .grand-total {
-            font-size: 18px;
-            font-weight: 700
-        }
-
-        #invoiceSection {
-            display: none
+        .btn-primary {
+            background: #263d64;
+            border-color: #263d64;
         }
 
         @media print {
-            body * {
-                visibility: hidden
+            body {
+                background: #fff;
             }
 
-            #invoice,
-            #invoice * {
-                visibility: visible
+            .quotation-card {
+                margin: 0;
+                max-width: 100%;
+                padding: 0;
+                box-shadow: none;
             }
 
-            #invoice {
-                position: absolute;
-                left: 0;
-                top: 0;
-                width: 100%
+            .no-print {
+                display: none !important;
             }
-        }
 
-        input[type="date"]::-webkit-calendar-picker-indicator {
-            display: none
-        }
+            input,
+            select,
+            textarea {
+                border: 0 !important;
+                box-shadow: none !important;
+                appearance: none;
+            }
 
-        .input-group-text {
-            background: transparent;
-            border-right: 0;
-        }
-
-        .input-group .form-control {
-            border-left: 0;
-            padding-left: 0;
+            .table thead th {
+                background: #263d64 !important;
+                color: white !important;
+                print-color-adjust: exact;
+                -webkit-print-color-adjust: exact;
+            }
         }
     </style>
 </head>
 
 <body>
-    <nav class="navbar navbar-expand-lg navbar-dark bg-dark py-3">
-        <div class="container">
-            <a class="navbar-brand text-white" href="index.php">CC Camera</a>
-            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarSupportedContent" aria-controls="navbarSupportedContent" aria-expanded="false" aria-label="Toggle navigation">
-                <span class="navbar-toggler-icon"></span>
-            </button>
-            <div class="collapse navbar-collapse" id="navbarSupportedContent">
-                <ul class="navbar-nav mx-auto mb-2 mb-lg-0">
-                    <li class="nav-item">
-                        <a class="nav-link text-white active" aria-current="page" href="index.php">HOME</a>
-                    </li>
-                    <li class="nav-item">
-                        <a class="nav-link text-white" href="hd-camera.php">HD CAMERA</a>
-                    </li>
-                    <li class="nav-item">
-                        <a class="nav-link text-white" href="ip-camera.php">IP CAMERA</a>
-                    </li>
 
-                    <li class="nav-item dropdown">
-                        <a class="nav-link text-white dropdown-toggle" href="#" role="button" data-bs-toggle="dropdown" aria-expanded="false">
-                            MORE
-                        </a>
-                        <ul class="dropdown-menu dropdown-menu-dark">
-                            <li><a class="dropdown-item" href="#">Action</a></li>
-                            <li><a class="dropdown-item" href="#">Another action</a></li>
-                            <li>
-                                <hr class="dropdown-divider">
-                            </li>
-                            <li><a class="dropdown-item" href="#">Something else here</a></li>
-                        </ul>
-                    </li>
-                </ul>
+    <div class="container-fluid">
+        <div class="quotation-card">
+
+            <div class="d-flex justify-content-between align-items-start
+                    flex-wrap gap-3 mb-4">
+                <div>
+                    <h2 class="page-heading mb-1">HD Camera Quotation</h2>
+                    <p class="text-secondary mb-0">
+                        CCTV Product Quotation Management
+                    </p>
+                </div>
+
+                <div class="no-print d-flex gap-2 flex-wrap">
+                    <button type="button" class="btn btn-outline-secondary"
+                        onclick="window.print()">
+                        Print
+                    </button>
+
+                    <button type="button" class="btn btn-primary"
+                        onclick="addRow()">
+                        + Add Product
+                    </button>
+                </div>
             </div>
+
+            <?php if ($message): ?>
+                <div class="alert alert-success">
+                    <?= $message ?>
+                </div>
+            <?php endif; ?>
+
+            <?php if ($error): ?>
+                <div class="alert alert-danger">
+                    <?= htmlspecialchars($error) ?>
+                </div>
+            <?php endif; ?>
+
+            <form method="POST" id="quotationForm">
+
+                <div class="row g-3 mb-4">
+                    <div class="col-md-6 col-lg-4">
+                        <label class="form-label">Customer Name</label>
+                        <input type="text" name="customer_name"
+                            class="form-control"
+                            value="<?= htmlspecialchars($customerName) ?>"
+                            placeholder="Enter customer name">
+                    </div>
+
+                    <div class="col-md-6 col-lg-4">
+                        <label class="form-label">Phone</label>
+                        <input type="text" name="phone"
+                            class="form-control"
+                            value="<?= htmlspecialchars($phone) ?>"
+                            placeholder="Enter phone number">
+                    </div>
+
+                    <div class="col-md-6 col-lg-4">
+                        <label class="form-label">Quotation Date</label>
+                        <input type="date" name="quotation_date"
+                            class="form-control" required
+                            value="<?= htmlspecialchars($quotationDate) ?>">
+                    </div>
+
+                    <div class="col-md-6 col-lg-4">
+                        <label class="form-label">Invoice No.</label>
+                        <input type="text" name="invoice_no"
+                            class="form-control" required
+                            value="<?= htmlspecialchars($invoiceNo) ?>">
+                    </div>
+
+                    <div class="col-12 col-lg-8">
+                        <label class="form-label">Customer Address</label>
+                        <textarea name="address" class="form-control"
+                            rows="2"
+                            placeholder="Enter customer address"><?= htmlspecialchars($address) ?></textarea>
+                    </div>
+                </div>
+
+                <div class="table-responsive mb-4">
+                    <table class="table table-bordered" id="quotationTable">
+                        <thead>
+                            <tr>
+                                <th style="width: 65px">SL</th>
+                                <th>Product</th>
+                                <th style="width: 130px">Quantity</th>
+                                <th style="width: 160px">Price</th>
+                                <th style="width: 170px">Total Price</th>
+                                <th class="no-print" style="width: 90px">Action</th>
+                            </tr>
+                        </thead>
+
+                        <tbody id="quotationBody"></tbody>
+                    </table>
+                </div>
+
+                <div class="d-flex justify-content-between align-items-center
+                        flex-wrap gap-3">
+                    <button type="button" class="btn btn-outline-primary no-print"
+                        onclick="addRow()">
+                        + Add Another Product
+                    </button>
+
+                    <div class="total-box">
+                        Grand Total: ৳ <span id="grandTotal">0.00</span>
+                    </div>
+                </div>
+
+                <div class="d-flex gap-2 justify-content-end mt-4 no-print">
+                    <button type="reset" class="btn btn-outline-secondary"
+                        onclick="setTimeout(resetRows, 0)">
+                        Reset
+                    </button>
+
+                    <button type="submit" name="save_quotation"
+                        value="1" class="btn btn-success px-4">
+                        Save Quotation
+                    </button>
+                </div>
+            </form>
         </div>
-    </nav>
-    <div class="container my-5">
-        <!-- ================= FORM ================= -->
-        <div class="box" id="formSection">
-            <h3 class="text-center fw-bold mb-4">HD Camera Quotation</h3>
-
-            <div class="row g-2 mb-4">
-                <div class="col-md-4">
-                    <div class="input-group">
-                        <span class="input-group-text"><i class="bi bi-person-fill"></i></span>
-                        <input id="cName" class="form-control" placeholder="Customer Name">
-                    </div>
-                </div>
-                <div class="col-md-4">
-                    <div class="input-group">
-                        <span class="input-group-text"><i class="bi bi-telephone-fill"></i></span>
-                        <input id="cPhone" class="form-control" placeholder="Phone">
-                    </div>
-                </div>
-                <div class="col-md-4">
-                    <div class="input-group">
-                        <span class="input-group-text"><i class="fa-solid fa-calendar-days"></i></span>
-                        <input id="cDate" type="date" class="form-control">
-                    </div>
-                </div>
-                <div class="col-md-8">
-                    <div class="input-group">
-                        <span class="input-group-text"><i class="bi bi-geo-alt-fill"></i></span>
-                        <input id="cAddress" class="form-control" placeholder="Address">
-                    </div>
-                </div>
-                <div class="col-md-4">
-                    <div class="input-group">
-                        <span class="input-group-text"><i class="fa-solid fa-hashtag"></i></span>
-                        <input id="cNo" class="form-control" placeholder="Invoice No." value="0">
-                    </div>
-                </div>
-            </div>
-
-            <div class="table-responsive">
-                <table class="table table-bordered align-middle">
-                    <thead>
-                        <tr>
-                            <th class="check"><input type="checkbox" id="selectAll"></th>
-                            <th class="sl">SL</th>
-                            <th>Product</th>
-                            <th>Quantity</th>
-                            <th>Price</th>
-                            <th>Total Price</th>
-                        </tr>
-                    </thead>
-                    <tbody id="productTable"></tbody>
-                    <tfoot>
-                        <tr>
-                            <td colspan="5" class="text-end grand-total">Grand Total</td>
-                            <td><input type="number" id="grandTotal" class="form-control grand-total text-center" value="0" readonly></td>
-                        </tr>
-                    </tfoot>
-                </table>
-            </div>
-
-            <div class="d-flex flex-wrap gap-2 mt-3">
-                <button class="btn btn-primary" id="addProduct"><i class="bi bi-plus-lg"></i> Add Product</button>
-                <button class="btn btn-danger" id="deleteSelected"><i class="bi bi-trash"></i> Delete Selected</button>
-                <button class="btn btn-dark ms-auto" id="makeInvoice"><i class="bi bi-receipt"></i> Invoice</button>
-            </div>
-        </div>
-
-        <!-- ================= INVOICE ================= -->
-        <div id="invoiceSection">
-            <div class="d-flex flex-wrap gap-2 mb-3">
-                <button class="btn btn-secondary" id="backBtn"><i class="bi bi-arrow-left"></i> Back</button>
-                <button class="btn btn-success" id="pdfBtn"><i class="bi bi-file-earmark-pdf"></i> PDF Download</button>
-                <button class="btn btn-outline-dark" id="printBtn"><i class="bi bi-printer"></i> Print</button>
-            </div>
-            <div class="card shadow-sm">
-                <div class="card-body p-4 bg-white" id="invoice"></div>
-            </div>
-        </div>
-
     </div>
- <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+
     <script>
-        const OPTS = {
-            camera: [
-                "Hikvision Bullet Camera-2MP",
-                "Hikvision Bullet Camera-3MP",
-                "Hikvision Dome Camera-2MP",
-                "Hikvision Dome Camera-3MP",
-                "Dahua Bullet Camera-2MP",
-                "Dahua Bullet Camera-3MP",
-                "Dahua Dome Camera-2MP",
-                "Dahua Dome Camera-3MP"
-            ],
-            dvr: ["Hikvision 4 Channel DVR", "Hikvision 8 Channel DVR", "Hikvision 16 Channel DVR", "Dahua 4 Channel DVR", "Dahua 8 Channel DVR", "Dahua 16 Channel DVR"],
-            hdd: ["500 GB Surveillance HDD", "1TB Surveillance HDD", "2TB Surveillance HDD", "4TB Surveillance HDD", "6TB Surveillance HDD", "8TB Surveillance HDD"]
-        };
-        const LABEL = {
-            camera: "Camera",
-            dvr: "DVR",
-            hdd: "HDD"
-        };
-        const $ = s => document.querySelector(s);
-        const $$ = s => [...document.querySelectorAll(s)];
-        const tbody = $("#productTable");
+        const PRODUCTS = <?= $productJson ?: '[]' ?>;
 
-        function rowHTML(kind, name = "", priceOnly = false) {
-            let product;
-            if (OPTS[kind]) {
-                product = `<div class="d-flex"><select class="form-select product-select">
-      <option value="">Select ${LABEL[kind]}</option>${OPTS[kind].map(o=>`<option>${o}</option>`).join("")}
-      </select><button type="button" class="btn btn-success plus-btn add-type-row" data-type="${kind}"><i class="bi bi-plus-lg"></i></button></div>`;
-            } else {
-                product = `<input type="text" class="form-control name-input" value="${name}" placeholder="Product Name">`;
+        const TYPE_LABELS = {
+            camera: 'Camera',
+            dvr: 'DVR',
+            hdd: 'HDD',
+            adapter: 'Box Adapter',
+            video_balun: 'Video Balun',
+            installation: 'Installation',
+            accessories: 'Other Accessories',
+            cable: 'CAT6 Cable'
+        };
+
+        const tbody = document.getElementById('quotationBody');
+
+        function escapeHtml(value) {
+            return String(value ?? '').replace(/[&<>"']/g, char => ({
+                '&': '&amp;',
+                '<': '&lt;',
+                '>': '&gt;',
+                '"': '&quot;',
+                "'": '&#039;'
+            })[char]);
+        }
+
+        function productOptions(selectedId = '') {
+            let html = '<option value="">-- Select Product --</option>';
+
+            Object.keys(TYPE_LABELS).forEach(type => {
+                const items = PRODUCTS.filter(product => product.type === type);
+
+                if (!items.length) return;
+
+                html += `<optgroup label="${escapeHtml(TYPE_LABELS[type])}">`;
+
+                items.forEach(product => {
+                    const selected = String(product.id) === String(selectedId) ?
+                        'selected' :
+                        '';
+
+                    const model = product.model ?
+                        ` (${product.model})` :
+                        '';
+
+                    html += `
+                <option value="${product.id}"
+                        data-price="${Number(product.price)}"
+                        ${selected}>
+                    ${escapeHtml(product.name + model)}
+                </option>
+            `;
+                });
+
+                html += '</optgroup>';
+            });
+
+            return html;
+        }
+
+        function addRow(productId = '', quantity = 1, price = '') {
+            const row = document.createElement('tr');
+
+            row.innerHTML = `
+        <td class="serial text-center"></td>
+
+        <td class="product-cell">
+            <select name="product_id[]" class="form-select product-select"
+                    required>
+                ${productOptions(productId)}
+            </select>
+        </td>
+
+        <td>
+            <input type="number" name="quantity[]"
+                   class="form-control quantity"
+                   min="0" step="0.01" value="${quantity}" required>
+        </td>
+
+        <td>
+            <input type="number" name="price[]"
+                   class="form-control price"
+                   min="0" step="0.01" value="${price}" required>
+        </td>
+
+        <td class="text-end">
+            ৳ <span class="line-total">0.00</span>
+        </td>
+
+        <td class="text-center no-print">
+            <button type="button" class="btn btn-sm btn-danger delete-row">
+                Delete
+            </button>
+        </td>
+    `;
+
+            tbody.appendChild(row);
+
+            const select = row.querySelector('.product-select');
+            const priceInput = row.querySelector('.price');
+
+            select.addEventListener('change', function() {
+                const option = this.options[this.selectedIndex];
+
+                if (this.value !== '') {
+                    priceInput.value = Number(option.dataset.price || 0).toFixed(2);
+                } else {
+                    priceInput.value = '0.00';
+                }
+
+                calculate();
+            });
+
+            row.querySelector('.quantity').addEventListener('input', calculate);
+            priceInput.addEventListener('input', calculate);
+
+            row.querySelector('.delete-row').addEventListener('click', function() {
+                row.remove();
+                updateSerials();
+                calculate();
+            });
+
+            if (productId) {
+                const option = select.options[select.selectedIndex];
+                if (option && option.dataset.price !== undefined && price === '') {
+                    priceInput.value = Number(option.dataset.price).toFixed(2);
+                }
             }
-            const qty = `<input type="number" class="form-control quantity" value="" min="0" placeholder="0">`;
-            return `<td class="check"><input type="checkbox" class="row-check"></td><td class="sl"></td>
-    <td>${product}</td>
-    <td>${qty}</td>
-    <td><input type="number" class="form-control price" value="" min="0" placeholder="0"></td>
-    <td><input type="number" class="form-control total" value="0" readonly></td>`;
+
+            updateSerials();
+            calculate();
         }
 
-        function addRow(kind, name, priceOnly, after) {
-            const tr = document.createElement("tr");
-            tr.className = "product-row";
-            if (priceOnly) tr.dataset.priceOnly = "1";
-            tr.innerHTML = rowHTML(kind, name, priceOnly);
-            after ? after.after(tr) : tbody.appendChild(tr);
-            refresh();
-        }
-
-        function refresh() {
-            let grand = 0;
-            $$("#productTable .product-row").forEach((r, i) => {
-                r.querySelector(".sl").innerText = i + 1;
-                const p = parseFloat(r.querySelector(".price").value) || 0;
-                const q = parseFloat(r.querySelector(".quantity").value) || 0;
-                const t = r.dataset.priceOnly ? p : p * q;
-                r.querySelector(".total").value = t;
-                grand += t;
+        function updateSerials() {
+            [...tbody.querySelectorAll('tr')].forEach((row, index) => {
+                row.querySelector('.serial').textContent = index + 1;
             });
-            $("#grandTotal").value = grand;
-            const all = $$(".row-check");
-            $("#selectAll").checked = all.length > 0 && all.every(c => c.checked);
         }
 
-        // Initial rows
-        addRow("camera");
-        addRow("dvr");
-        addRow("hdd");
-        ["Box Adapter", "Video Balun", "Installation Charge"].forEach(n => addRow("text", n));
-        addRow("text", "Other Accessories", true);
-        addRow("text", "CAT6 Cable");
+        function calculate() {
+            let grandTotal = 0;
 
-        document.addEventListener("click", e => {
-            const b = e.target.closest(".add-type-row");
-            if (b) addRow(b.dataset.type, "", false, b.closest(".product-row"));
-        });
-        document.addEventListener("input", e => {
-            if (e.target.matches(".price,.quantity")) refresh();
-        });
-        document.addEventListener("change", e => {
-            if (e.target.matches(".row-check")) refresh();
-        });
-        $("#selectAll").addEventListener("change", function() {
-            $$(".row-check").forEach(c => c.checked = this.checked);
-        });
-        $("#addProduct").addEventListener("click", () => addRow("text"));
-        $("#deleteSelected").addEventListener("click", () => {
-            $$(".row-check:checked").forEach(c => c.closest(".product-row").remove());
-            refresh();
-        });
+            [...tbody.querySelectorAll('tr')].forEach(row => {
+                const quantity = Math.max(
+                    0, Number(row.querySelector('.quantity').value) || 0
+                );
 
-        // Default date
-        $("#cDate").value = new Date().toISOString().slice(0, 10);
+                const price = Math.max(
+                    0, Number(row.querySelector('.price').value) || 0
+                );
 
-        // ================= INVOICE =================
-        const money = n => "৳ " + Number(n).toLocaleString("en-IN");
-        const esc = s => String(s).replace(/[&<>"]/g, c => ({
-            "&": "&amp;",
-            "<": "&lt;",
-            ">": "&gt;",
-            '"': "&quot;"
-        } [c]));
+                const total = quantity * price;
 
-        $("#makeInvoice").addEventListener("click", () => {
-            refresh();
-            let rows = "",
-                n = 0;
-            $$("#productTable .product-row").forEach(r => {
-                const sel = r.querySelector("select");
-                const name = sel ? sel.value : r.querySelector(".name-input").value.trim();
-                const price = parseFloat(r.querySelector(".price").value) || 0;
-                const total = parseFloat(r.querySelector(".total").value) || 0;
-                if (!name || total <= 0) return;
-                const qty = r.querySelector(".quantity").value || "—";
-                n++;
-                rows += `<tr><td class="text-center">${n}</td><td>${esc(name)}</td>
-      <td class="text-center">${qty}</td><td class="text-end">${money(price)}</td>
-      <td class="text-end">${money(total)}</td></tr>`;
+                row.querySelector('.line-total').textContent = total.toFixed(2);
+                grandTotal += total;
             });
-            if (!n) {
-                alert("কমপক্ষে একটি প্রোডাক্টের নাম, দাম ও পরিমাণ দিন।");
+
+            document.getElementById('grandTotal').textContent =
+                grandTotal.toLocaleString('en-BD', {
+                    minimumFractionDigits: 2,
+                    maximumFractionDigits: 2
+                });
+        }
+
+        function resetRows() {
+            tbody.innerHTML = '';
+            addRow();
+        }
+
+        document.getElementById('quotationForm').addEventListener('submit', function(e) {
+            const rows = tbody.querySelectorAll('tr');
+
+            if (rows.length === 0) {
+                e.preventDefault();
+                alert('Please add at least one product.');
                 return;
             }
 
-            $("#invoice").innerHTML = `
-    <div class="text-center mb-4">
-      <h2 class=" mb-1"><i class="bi bi-camera-video"></i> INVOICE</h2>
-      <p class="text-muted mb-0">Your Security, Our Responsibility – Next Barisal</p>
-    </div>
-    <hr>
-    <div class="row mb-4">
-      <div class="col-6">
-        <div><i class="bi bi-person-fill"></i> <b>Customer:</b> ${esc($("#cName").value)}</div>
-        <div><i class="bi bi-telephone-fill"></i> <b>Phone:</b> ${esc($("#cPhone").value)}</div>
-        <div><i class="bi bi-geo-alt-fill"></i> <b>Address:</b> ${esc($("#cAddress").value)}</div>
-      </div>
-      <div class="col-6 text-end">
-        <div><i class="bi bi-hash"></i> <b>Invoice No:</b> ${esc($("#cNo").value)}</div>
-        <div><i class="bi bi-calendar-event"></i> <b>Date:</b> ${esc($("#cDate").value)}</div>
-      </div>
-    </div>
-    <table class="table table-bordered table-striped align-middle">
-      <thead class="table-dark text-center"><tr><th>SL</th><th>Product</th><th>Qty</th><th>Price</th><th>Total</th></tr></thead>
-      <tbody>${rows}</tbody>
-      <tfoot><tr class="table-light"><td colspan="4" class="text-end fw-bold">Grand Total</td>
-        <td class="text-end fw-bold">${money($("#grandTotal").value)}</td></tr></tfoot>
-    </table>
-    <div class="d-flex justify-content-between text-center mt-5 pt-4">
-      <div class="border-top pt-1 px-4">Customer Signature</div>
-      <div class="border-top pt-1 px-4">Authorized Signature</div>
-    </div>`;
-            $("#formSection").style.display = "none";
-            $("#invoiceSection").style.display = "block";
-            window.scrollTo(0, 0);
-        });
+            let hasProduct = false;
 
-        $("#backBtn").addEventListener("click", () => {
-            $("#invoiceSection").style.display = "none";
-            $("#formSection").style.display = "block";
-        });
-        $("#printBtn").addEventListener("click", () => window.print());
-
-        $("#pdfBtn").addEventListener("click", () => {
-            // Selected camera name
-            const cameraSelect = document.querySelector(
-                '#productTable .product-row select'
-            );
-
-            const cameraName = cameraSelect ?
-                cameraSelect.value.trim() :
-                "";
-
-            // File name
-            const fileName = cameraName ?
-                cameraName.replace(/[<>:"/\\|?*]/g, "-") + ".pdf" :
-                "CCTV-Invoice.pdf";
-
-            html2pdf().set({
-                margin: 10,
-                filename: fileName,
-                image: {
-                    type: "jpeg",
-                    quality: 0.98
-                },
-                html2canvas: {
-                    scale: 2
-                },
-                jsPDF: {
-                    unit: "mm",
-                    format: "a4",
-                    orientation: "portrait"
+            rows.forEach(row => {
+                if (row.querySelector('.product-select').value !== '') {
+                    hasProduct = true;
                 }
-            }).from($("#invoice")).save();
+            });
+
+            if (!hasProduct) {
+                e.preventDefault();
+                alert('Please select at least one product.');
+            }
         });
+
+        addRow();
     </script>
+
 </body>
 
 </html>
